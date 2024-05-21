@@ -1,3 +1,3 @@
-# Dashboard Template
+# Веб приложения для предсказания временных рядов
 
-This is a Reflex starter template for a dashboard app.
+Проект, разработанный в рамках выпускной квалификационной работы.
