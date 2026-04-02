@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import List
 
@@ -6,9 +7,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import reflex as rx
 from openpyxl import load_workbook
-from openpyxl.formula import Tokenizer
+from openpyxl.utils import column_index_from_string
 from plotly.graph_objs import Figure
-from scipy.signal import savgol_filter
 
 
 class FigureWithTitle(rx.Base):
@@ -49,14 +49,30 @@ class State(rx.State):
 
             self.parse_loaded_file(outfile)
 
-    def parse_formula(self, test=True, formula_str=''):
-        if test:
-            return lambda x: x[0] * x[1] + x[2] * x[3] + x[4] * x[5]
-        tokens = Tokenizer(formula_str).items
-        formula_tokens = [t.value for t in tokens if t.type == 'operand']
-        # TODO cast to Python function
-        formula = ''.join(formula_tokens)
-        return formula
+    def parse_formula(self, formula_str: str = '', col_names: list = None):
+        """Parse an Excel formula string and return a callable for row-wise application.
+
+        Maps cell references like B2, C3 to DataFrame column names using col_names list,
+        where col_names[0] corresponds to Excel column B (first data column after index).
+        Falls back to a hardcoded formula if formula_str or col_names are not provided.
+        """
+        if not formula_str or not col_names:
+            return lambda row: row.iloc[0] * row.iloc[1] + row.iloc[2] * row.iloc[3] + row.iloc[4] * row.iloc[5]
+
+        # Remove leading '=' if present
+        expr = formula_str.lstrip('=')
+
+        # Replace Excel cell references (e.g. B2, C3) with DataFrame row accesses.
+        # Excel column A (index=1) is the date index, so B (index=2) → col_names[0].
+        def replace_ref(match):
+            col_letter = match.group(1)
+            col_idx = column_index_from_string(col_letter) - 2
+            if 0 <= col_idx < len(col_names):
+                return f'row["{col_names[col_idx]}"]'
+            return match.group(0)
+
+        expr = re.sub(r'([A-Z]+)\d+', replace_ref, expr)
+        return eval(f'lambda row: {expr}')
 
     def predict(self, test=True):
         if test:
@@ -71,40 +87,40 @@ class State(rx.State):
 
     def plot_with_conf(self, col) -> Figure:
         df = self.predicted_document
-        CI = np.quantile(df[col], 0.01)
-        fig = go.Figure()
+        history = df[df.index < self.date][col]
+        forecast = df[df.index >= self.date][col]
 
+        # Estimate volatility from historical first differences.
+        # For a random walk, forecast uncertainty grows as sigma * sqrt(h).
+        sigma = history.diff().dropna().std()
+        horizons = np.arange(1, len(forecast) + 1)
+        ci_half = 1.96 * sigma * np.sqrt(horizons)
+
+        fig = go.Figure()
         fig.add_traces(
             [
                 go.Scatter(
-                    x=df[df.index < self.date].index,
-                    y=df[df.index < self.date][col].values,
+                    x=history.index,
+                    y=history.values,
                     mode="lines",
                     name='history'
                 ),
                 go.Scatter(
-                    x=df[df.index >= self.date].index,
-                    y=df[df.index >= self.date][col].values,
+                    x=forecast.index,
+                    y=forecast.values,
                     mode="lines",
                     name='forecast'
                 ),
                 go.Scatter(
-                    x=df[df.index >= self.date].index,
-                    y=df[df.index >= self.date][col] + savgol_filter(
-                        np.random.random(size=df[df.index >= self.date].shape[0]),
-                        50, 2
-                    ) * CI,
+                    x=forecast.index,
+                    y=forecast.values + ci_half,
                     mode='lines',
                     line_color='rgba(0,0,0,0)',
                     showlegend=False
                 ),
                 go.Scatter(
-                    x=df[df.index >= self.date].index,
-                    y=df[df.index >= self.date][col] - savgol_filter(
-                        np.random.random(size=df[df.index >= self.date].shape[0]),
-                        50,
-                        2
-                    ) * CI,
+                    x=forecast.index,
+                    y=forecast.values - ci_half,
                     mode='lines',
                     line_color='rgba(0,0,0,0)',
                     name='95% confidence interval',
@@ -136,19 +152,20 @@ class State(rx.State):
         df = pd.read_excel(outfile, index_col=0)
         df.index = pd.to_datetime(df.index)
 
-        if 'total' in df.columns:
-            wb = load_workbook(outfile)
-            sheet = wb.active
-            # Прочитать формулу из последней строки и последнего столбца
-            formula_str = sheet.cell(row=2, column=sheet.max_column).value
-            self.parse_formula(formula_str=formula_str)
-        else:
-            self.parse_formula()
-
         # TODO validation
         self.loaded_document = df
         self.date = str(df[df.isna().any(axis=1)].index.min())[:10]
-        if 'total' in self.loaded_document.columns:
+
+        if 'total' in df.columns:
+            # load_workbook reads formula strings by default (data_only=False)
+            wb = load_workbook(outfile)
+            sheet = wb.active
+            # Read formula from row 2 of the last (total) column
+            formula_str = sheet.cell(row=2, column=sheet.max_column).value
+            # col_names maps Excel col B→[0], C→[1], … to DataFrame column names
+            col_names = list(df.columns)
+            self.formula = self.parse_formula(formula_str=formula_str, col_names=col_names)
+        else:
             self.formula = self.parse_formula()
 
     def login_submit(self, form):
