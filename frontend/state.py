@@ -27,11 +27,22 @@ class State(rx.State):
     figs2: List[FigureWithTitle] = []
     total: FigureWithTitle = None
     loaded_document: pd.DataFrame = pd.DataFrame()
+    preview_document: pd.DataFrame = pd.DataFrame()
     predicted_document: pd.DataFrame = pd.DataFrame()
     date: str = ''
     best_model: str = 'Arima'
     best_score: str = 'SMAPE = 6.7%, MSE = 450.787'
     is_authenticated: bool = False
+    # Validation state
+    validation_errors: List[str] = []
+    driver_cols: List[str] = []
+    input_cols: List[str] = []
+    has_total: bool = False
+    total_formula_display: str = ''
+    first_date: str = ''
+    forecast_end: str = ''
+    data_freq: str = ''
+    is_valid: bool = False
     print(datetime.now())
 
     async def handle_upload(self, files: list[rx.UploadFile]):
@@ -148,24 +159,114 @@ class State(rx.State):
             )
             self.total.fig.write_image(f"assets/fig.png")
 
+    def _run_validation(self, df: pd.DataFrame):
+        """Validate the uploaded DataFrame and populate validation state vars."""
+        errors = []
+
+        # 1. Column naming convention: all columns must start with input_/driver_ or be 'total'
+        bad_cols = [
+            c for c in df.columns
+            if not (c.startswith('input_') or c.startswith('driver_') or c == 'total')
+        ]
+        if bad_cols:
+            errors.append(
+                f"Неверные названия колонок: {', '.join(bad_cols)}. "
+                "Ожидается префикс 'input_', 'driver_' или значение 'total'."
+            )
+
+        # 2. At least one driver and one input column
+        drivers = [c for c in df.columns if c.startswith('driver_')]
+        inputs = [c for c in df.columns if c.startswith('input_')]
+        if not drivers:
+            errors.append("Не найдено ни одной колонки с префиксом 'driver_'.")
+        if not inputs:
+            errors.append("Не найдено ни одной колонки с префиксом 'input_'.")
+
+        # 3. Detectable time series frequency
+        freq = pd.infer_freq(df.index)
+        freq_map = [('D', 'Дневная'), ('W', 'Недельная'), ('M', 'Месячная'),
+                    ('Q', 'Квартальная'), ('Y', 'Годовая'), ('A', 'Годовая')]
+        if freq is None:
+            errors.append(
+                "Не удалось определить частоту временного ряда. "
+                "Убедитесь, что даты идут с одинаковым шагом."
+            )
+            self.data_freq = 'Не определена'
+        else:
+            self.data_freq = next(
+                (label for prefix, label in freq_map if freq.upper().startswith(prefix)),
+                freq
+            )
+
+        # 4. Forecast period must be marked by NaN rows in driver columns
+        nan_mask = df.isna().any(axis=1)
+        if not nan_mask.any():
+            errors.append(
+                "Период прогноза не определён. "
+                "Ожидаются строки с пропусками в колонках драйверов для периода прогноза."
+            )
+        else:
+            forecast_start = df[nan_mask].index.min()
+            train = df[df.index < forecast_start]
+            forecast = df[df.index >= forecast_start]
+
+            # 5. Training period must have no NaN in any column
+            if train.isna().any().any():
+                missing_train = train.columns[train.isna().any()].tolist()
+                errors.append(
+                    f"Обучающая выборка содержит пропуски в колонках: {', '.join(missing_train)}."
+                )
+
+            # 6. Input columns must be fully specified in the forecast period
+            if inputs:
+                missing_inputs = forecast[inputs].columns[forecast[inputs].isna().any()].tolist()
+                if missing_inputs:
+                    errors.append(
+                        f"Сценарные колонки содержат пропуски в периоде прогноза: "
+                        f"{', '.join(missing_inputs)}."
+                    )
+
+            self.forecast_end = str(df.index.max())[:10]
+
+        self.driver_cols = drivers
+        self.input_cols = inputs
+        self.first_date = str(df.index.min())[:10]
+        self.validation_errors = errors
+        self.is_valid = len(errors) == 0
+
     def parse_loaded_file(self, outfile):
         df = pd.read_excel(outfile, index_col=0)
         df.index = pd.to_datetime(df.index)
 
-        # TODO validation
         self.loaded_document = df
+        preview = df.head(3).reset_index()
+        preview.iloc[:, 1:] = preview.iloc[:, 1:].round(2)
+        self.preview_document = preview
         self.date = str(df[df.isna().any(axis=1)].index.min())[:10]
 
+        self._run_validation(df)
+
         if 'total' in df.columns:
+            self.has_total = True
             # load_workbook reads formula strings by default (data_only=False)
             wb = load_workbook(outfile)
             sheet = wb.active
             # Read formula from row 2 of the last (total) column
             formula_str = sheet.cell(row=2, column=sheet.max_column).value
-            # col_names maps Excel col B→[0], C→[1], … to DataFrame column names
             col_names = list(df.columns)
             self.formula = self.parse_formula(formula_str=formula_str, col_names=col_names)
+            # Build human-readable formula string for display
+            if formula_str:
+                def replace_display(match):
+                    col_idx = column_index_from_string(match.group(1)) - 2
+                    if 0 <= col_idx < len(col_names):
+                        return col_names[col_idx]
+                    return match.group(0)
+                self.total_formula_display = re.sub(
+                    r'([A-Z]+)\d+', replace_display, formula_str.lstrip('=')
+                )
         else:
+            self.has_total = False
             self.formula = self.parse_formula()
 
     def login_submit(self, form):
@@ -191,10 +292,20 @@ class State(rx.State):
 
     def clean(self):
         self.loaded_document = pd.DataFrame()
+        self.preview_document = pd.DataFrame()
         self.date = ''
         self.total = None
         self.figs1.clear()
         self.figs2.clear()
+        self.validation_errors = []
+        self.driver_cols = []
+        self.input_cols = []
+        self.has_total = False
+        self.total_formula_display = ''
+        self.first_date = ''
+        self.forecast_end = ''
+        self.data_freq = ''
+        self.is_valid = False
 
     def check_authentication(self):
         print(self.is_authenticated)
